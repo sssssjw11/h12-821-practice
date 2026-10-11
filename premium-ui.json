@@ -1,0 +1,11 @@
+{
+  "profile":"product-admin",
+  "sourceRoots":["src"],
+  "locale":"zh-CN",
+  "canonicalMap":"UX-CONTRACT.md",
+  "requiredCapabilities":["Select/Listbox","Form","Scrollbar","Toast","CRUD"],
+  "ownership":{"Select/Listbox":"native"},
+  "requiredCommands":["format","typecheck","unit","build"],
+  "commands":{"format":"pnpm format:check","typecheck":"pnpm typecheck","unit":"pnpm test","build":"pnpm build"},
+  "evidence":{"crudFullFlow":"tests/domain.test.ts","failurePaths":"tests/progress.test.ts"}
+}

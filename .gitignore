@@ -1,0 +1,19 @@
+node_modules/
+design/
+h12-821-practice-server/
+premium-audit.json
+验证说明.md
+*.tsbuildinfo
+*.log
+启动日志.txt
+*progress*.json
+*进度*.json
+.env
+.env.*
+!.env.example
+.cache/
+*.tmp
+.DS_Store
+Thumbs.db
+
+# dist/ and the server ZIP are deliberately tracked for ready-to-run delivery.
