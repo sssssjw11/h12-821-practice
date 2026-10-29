@@ -18,12 +18,13 @@ import remarkGfm from "remark-gfm";
 import {
   filterQuestions,
   gradeAnswer,
-  selectSession,
   type Bank,
   type QuestionKind,
 } from "./domain";
 import { Button, EmptyState, Modal } from "./components";
 import { AnswerRail, QuestionWorkspace } from "./Quiz";
+import { AccountDialog } from "./Account";
+import { hasLearning, progressKey, useAccount, useCloudProgress } from "./sync";
 import {
   emptyProgress,
   exportProgress,
@@ -31,6 +32,11 @@ import {
   recordGrade,
   useProgress,
   validateProgress,
+  applyPracticeSettings,
+  navigateProgress,
+  repairLegacySession,
+  STORAGE_KEY,
+  type PracticeSettings,
   type Progress,
   type View,
 } from "./progress";
@@ -80,7 +86,7 @@ export default function App() {
           !controller.signal.aborted ||
           !controller.signal.reason?.toString().includes("unmounted")
         )
-          setError("题库加载失败。请确认本地服务已启动，再重试。");
+          setError("题库加载失败。请确认服务和网络可用，再重试。");
       })
       .finally(() => clearTimeout(timer));
     return () => {
@@ -105,10 +111,33 @@ export default function App() {
         )}
       </div>
     );
-  return <PracticeApp bank={bank} />;
+  return <AccountApp bank={bank} />;
 }
 
-function PracticeApp({ bank }: { bank: Bank }) {
+function AccountApp({ bank }: { bank: Bank }) {
+  const account = useAccount();
+  if (account.backend === "checking")
+    return (
+      <div className="boot-screen" role="status">
+        正在读取学习进度…
+      </div>
+    );
+  return (
+    <PracticeApp
+      key={account.user?.id ?? "guest"}
+      bank={bank}
+      account={account}
+    />
+  );
+}
+
+function PracticeApp({
+  bank,
+  account,
+}: {
+  bank: Bank;
+  account: ReturnType<typeof useAccount>;
+}) {
   const {
     progress: p,
     setProgress,
@@ -116,7 +145,33 @@ function PracticeApp({ bank }: { bank: Bank }) {
     conflict,
     resolveConflict,
     enableSaving,
-  } = useProgress(bank);
+  } = useProgress(bank, account.user ? progressKey(account.user) : STORAGE_KEY);
+  const cloud = useCloudProgress(
+    bank,
+    account.user,
+    p,
+    setProgress,
+    Boolean(conflict),
+  );
+  const [accountOpen, setAccountOpen] = useState(false);
+  const [search, setSearch] = useState(p.settings.query);
+  const [migrationDone, setMigrationDone] = useState(false);
+  useEffect(() => setSearch(p.settings.query), [p.settings.query]);
+  const guestProgress = useMemo(() => {
+    if (!account.user || migrationDone) return null;
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      const guest = raw ? validateProgress(JSON.parse(raw), bank) : null;
+      const migrated = localStorage.getItem(
+        `${progressKey(account.user)}:migratedGuest`,
+      );
+      return guest && hasLearning(guest) && migrated !== String(guest.updatedAt)
+        ? guest
+        : null;
+    } catch {
+      return null;
+    }
+  }, [bank, account.user?.id, migrationDone]);
   const [notice, setNotice] = useState("");
   const [importError, setImportError] = useState("");
   const [modal, setModal] = useState<"result" | "reset" | "import" | null>(
@@ -172,48 +227,20 @@ function PracticeApp({ bank }: { bank: Bank }) {
   const update = (fn: (prev: Progress) => Progress) =>
     setProgress((prev) => ({ ...fn(prev), updatedAt: Date.now() }));
   const navigate = (next: View) => {
-    if (next === "knowledge" || next === "stats") {
-      if (view !== "knowledge" && view !== "stats") priorView.current = view;
-      update((prev) => ({
-        ...prev,
-        settings: { ...prev.settings, view: next },
-      }));
-      return;
-    }
-    if (view === "knowledge" || view === "stats") {
-      if (next === priorView.current) {
-        update((prev) => ({
-          ...prev,
-          settings: { ...prev.settings, view: next },
-        }));
-        return;
-      }
-    }
-    if (next === view) return;
-    const ids = bank.questions.filter((q) =>
-      next === "wrong"
-        ? wrongIds.has(q.id)
-        : next === "favorites"
-          ? favorites.has(q.id)
-          : true,
-    );
-    update((prev) => ({
-      ...prev,
-      settings: { chapter: 0, type: "all", count: 0, query: "", view: next },
-      session: newSession(selectSession(ids, "all", next === "random"), next),
-    }));
+    if (
+      (next === "knowledge" || next === "stats") &&
+      view !== "knowledge" &&
+      view !== "stats"
+    )
+      priorView.current = view;
+    update((prev) => navigateProgress(bank, prev, next));
+  };
+  const applyFilters = (patch: Partial<PracticeSettings>) => {
+    update((prev) => applyPracticeSettings(bank, prev, patch));
   };
   const start = () => {
-    update((prev) => ({
-      ...prev,
-      session: newSession(
-        selectSession(filtered, s.count || "all", view === "random"),
-        view,
-      ),
-    }));
-    setNotice(
-      `已开始本轮，共 ${s.count ? Math.min(s.count, filtered.length) : filtered.length} 道题。`,
-    );
+    applyFilters({ query: search });
+    setNotice("已按当前条件更新题单，已有作答保留。重新抽题可另开一轮。");
   };
   const jump = (cursor: number) =>
     update((prev) => ({ ...prev, session: { ...prev.session, cursor } }));
@@ -245,7 +272,12 @@ function PracticeApp({ bank }: { bank: Bank }) {
       return;
     }
     try {
-      setPendingImport(validateProgress(JSON.parse(await f.text()), bank));
+      setPendingImport(
+        repairLegacySession(
+          bank,
+          validateProgress(JSON.parse(await f.text()), bank),
+        ),
+      );
       setImportError("");
       setModal("import");
     } catch (e) {
@@ -300,22 +332,78 @@ function PracticeApp({ bank }: { bank: Bank }) {
             </button>
           ))}
         </nav>
-        <p className="local-progress">进度保存在此浏览器</p>
+        <p className="local-progress">
+          {account.user
+            ? `同步账号：${account.user.username}`
+            : "未登录 · 进度保存在此浏览器"}
+        </p>
       </aside>
       <div className="app-main">
         <header className="topbar">
           <span>H12-821 数通知识练习</span>
-          <Button
-            onClick={() => {
-              exportProgress(p);
-              setNotice("进度已导出，请保留下载的 JSON 文件。");
-            }}
-            aria-label="导出进度"
-          >
-            <Upload size={19} />
-            <span>导出进度</span>
-          </Button>
+          <div className="topbar-actions">
+            <Button
+              onClick={() => setAccountOpen(true)}
+              disabled={account.backend !== "available"}
+            >
+              {account.user ? account.user.username : "登录同步"}
+            </Button>
+            <Button
+              onClick={() => {
+                exportProgress(p);
+                setNotice("进度已导出，请保留下载的 JSON 文件。");
+              }}
+              aria-label="导出进度"
+            >
+              <Upload size={19} />
+              <span>导出进度</span>
+            </Button>
+          </div>
         </header>
+        {account.error && (
+          <div className="global-banner" role="status">
+            {account.error}
+            <Button onClick={() => void account.refresh()}>检查连接</Button>
+          </div>
+        )}
+        {account.user && (
+          <div className="sync-bar" role="status">
+            <span>{cloud.status}</span>
+            <Button
+              variant="ghost"
+              onClick={cloud.retry}
+              disabled={cloud.pending || Boolean(cloud.conflict)}
+            >
+              立即同步
+            </Button>
+            {cloud.expired && (
+              <Button onClick={() => setAccountOpen(true)}>重新登录</Button>
+            )}
+          </div>
+        )}
+        {cloud.conflict && (
+          <div className="global-banner" role="alert">
+            本设备有 {Object.keys(p.records).length} 道学习记录；服务器有{" "}
+            {Object.keys(cloud.conflict.progress?.records ?? {}).length}{" "}
+            道。请先备份，再选择保留版本。
+            <Button onClick={() => exportProgress(p)}>备份本设备</Button>
+            <Button
+              onClick={() => {
+                if (cloud.conflict?.progress)
+                  exportProgress(cloud.conflict.progress);
+              }}
+            >
+              备份服务器
+            </Button>
+            <Button
+              onClick={() => cloud.resolve(true)}
+              disabled={!cloud.conflict.progress}
+            >
+              使用服务器进度
+            </Button>
+            <Button onClick={() => cloud.resolve(false)}>使用本设备进度</Button>
+          </div>
+        )}
         {importError && (
           <div className="global-banner" role="alert">
             {importError}
@@ -368,7 +456,7 @@ function PracticeApp({ bank }: { bank: Bank }) {
                   ),
                 }));
               }}
-              onReturn={() => navigate(priorView.current)}
+              onReturn={() => navigate(p.session.mode ?? priorView.current)}
             />
           ) : view === "stats" ? (
             <Stats
@@ -405,15 +493,13 @@ function PracticeApp({ bank }: { bank: Bank }) {
                     <select
                       id="chapter-filter"
                       value={s.chapter}
-                      onChange={(e) =>
-                        update((prev) => ({
-                          ...prev,
-                          settings: {
-                            ...prev.settings,
-                            chapter: Number(e.target.value),
-                          },
-                        }))
-                      }
+                      onChange={(e) => {
+                        setSearch("");
+                        applyFilters({
+                          chapter: Number(e.target.value),
+                          query: "",
+                        });
+                      }}
                     >
                       <option value={0}>全部章节</option>
                       {bank.chapters.map((c) => (
@@ -428,12 +514,7 @@ function PracticeApp({ bank }: { bank: Bank }) {
                     <select
                       id="type-filter"
                       value={s.type}
-                      onChange={(e) =>
-                        update((prev) => ({
-                          ...prev,
-                          settings: { ...prev.settings, type: e.target.value },
-                        }))
-                      }
+                      onChange={(e) => applyFilters({ type: e.target.value })}
                     >
                       <option value="all">全部题型</option>
                       {Object.entries(kindLabels).map(([k, v]) => (
@@ -449,13 +530,7 @@ function PracticeApp({ bank }: { bank: Bank }) {
                       id="count-filter"
                       value={s.count}
                       onChange={(e) =>
-                        update((prev) => ({
-                          ...prev,
-                          settings: {
-                            ...prev.settings,
-                            count: Number(e.target.value),
-                          },
-                        }))
+                        applyFilters({ count: Number(e.target.value) })
                       }
                     >
                       <option value={0}>全部题目</option>
@@ -473,40 +548,26 @@ function PracticeApp({ bank }: { bank: Bank }) {
                       <input
                         id="question-search"
                         type="search"
-                        value={s.query}
+                        value={search}
                         placeholder="搜索题干 / 原题号"
                         maxLength={500}
-                        onChange={(e) =>
-                          update((prev) => ({
-                            ...prev,
-                            settings: {
-                              ...prev.settings,
-                              query: e.target.value,
-                            },
-                          }))
-                        }
+                        onChange={(e) => setSearch(e.target.value)}
                       />
-                      {s.query && (
+                      {search && (
                         <button
                           type="button"
                           aria-label="清除搜索"
-                          onClick={() =>
-                            update((prev) => ({
-                              ...prev,
-                              settings: { ...prev.settings, query: "" },
-                            }))
-                          }
+                          onClick={() => {
+                            setSearch("");
+                            applyFilters({ query: "" });
+                          }}
                         >
                           <X size={16} />
                         </button>
                       )}
                     </div>
-                    <Button
-                      type="submit"
-                      variant="primary"
-                      disabled={filtered.length === 0}
-                    >
-                      开始练习
+                    <Button type="submit" variant="primary">
+                      搜索 / 应用
                     </Button>
                   </form>
                   {(s.chapter ||
@@ -515,23 +576,20 @@ function PracticeApp({ bank }: { bank: Bank }) {
                     s.count > 0) && (
                     <div className="filter-summary" role="status">
                       {filtered.length ? (
-                        `符合条件 ${filtered.length} 道，点击“开始练习”更新本轮。`
+                        `符合条件 ${filtered.length} 道 · 本轮 ${current.ids.length} 道；章节、题型和题量即时生效。`
                       ) : (
                         <>
-                          没有符合条件的题目，当前练习已保留。
+                          没有符合条件的题目，请调整筛选。
                           <Button
                             variant="ghost"
-                            onClick={() =>
-                              update((prev) => ({
-                                ...prev,
-                                settings: {
-                                  ...prev.settings,
-                                  chapter: 0,
-                                  type: "all",
-                                  query: "",
-                                },
-                              }))
-                            }
+                            onClick={() => {
+                              setSearch("");
+                              applyFilters({
+                                chapter: 0,
+                                type: "all",
+                                query: "",
+                              });
+                            }}
                           >
                             清空筛选
                           </Button>
@@ -539,6 +597,20 @@ function PracticeApp({ bank }: { bank: Bank }) {
                       )}
                     </div>
                   )}
+                  <div className="round-actions">
+                    <span>切换页面会保留本轮位置与作答。</span>
+                    <Button
+                      variant="ghost"
+                      onClick={() =>
+                        update((prev) =>
+                          applyPracticeSettings(bank, prev, {}, true),
+                        )
+                      }
+                      disabled={filtered.length === 0}
+                    >
+                      {view === "random" ? "重新抽题" : "重新开始本轮"}
+                    </Button>
+                  </div>
                   {q && chapter ? (
                     <>
                       <div className="session-progress">
@@ -722,8 +794,14 @@ function PracticeApp({ bank }: { bank: Bank }) {
         </Modal>
       )}
       {modal === "reset" && (
-        <Modal title="清空此浏览器的学习进度？" onClose={() => setModal(null)}>
-          <p>将清空作答记录、错题、收藏和当前练习。建议先导出备份。</p>
+        <Modal title="清空学习进度？" onClose={() => setModal(null)}>
+          <p>
+            将清空作答记录、错题、收藏和当前练习。
+            {account.user
+              ? "此操作也会同步清空服务器上本账号的进度。"
+              : "仅影响此浏览器。"}
+            建议先导出备份。
+          </p>
           <div className="modal-actions">
             <Button onClick={() => setModal(null)}>保留进度</Button>
             <Button onClick={() => exportProgress(p)}>先导出备份</Button>
@@ -751,7 +829,8 @@ function PracticeApp({ bank }: { bank: Bank }) {
           <p>
             导入文件包含 {Object.keys(pendingImport.records).length}{" "}
             道题的学习记录、{pendingImport.favoriteIds.length}{" "}
-            道收藏。导入后会替换此浏览器现有进度。
+            道收藏。导入后会替换当前进度。
+            {account.user && "更改将同步到服务器上的本账号。"}
           </p>
           <div className="modal-actions">
             <Button
@@ -766,7 +845,25 @@ function PracticeApp({ bank }: { bank: Bank }) {
             <Button
               variant="primary"
               onClick={() => {
-                setProgress({ ...pendingImport, updatedAt: Date.now() });
+                if (
+                  pendingImport === guestProgress &&
+                  account.user &&
+                  guestProgress
+                ) {
+                  try {
+                    localStorage.setItem(
+                      `${progressKey(account.user)}:migratedGuest`,
+                      String(guestProgress.updatedAt),
+                    );
+                  } catch {
+                    /* keep source cache intact */
+                  }
+                  setMigrationDone(true);
+                }
+                setProgress({
+                  ...repairLegacySession(bank, pendingImport),
+                  updatedAt: Date.now(),
+                });
                 setPendingImport(null);
                 setModal(null);
                 setNotice("进度已导入，可继续上次练习。");
@@ -776,6 +873,30 @@ function PracticeApp({ bank }: { bank: Bank }) {
             </Button>
           </div>
         </Modal>
+      )}
+      {accountOpen && (
+        <AccountDialog
+          user={cloud.expired ? null : account.user}
+          onUser={(user) => {
+            account.setUser(user);
+            if (user) cloud.retry();
+          }}
+          onClose={() => setAccountOpen(false)}
+        />
+      )}
+      {guestProgress && !modal && (
+        <div className="migration-offer">
+          <span>检测到未登录时的本机进度</span>
+          <Button
+            variant="ghost"
+            onClick={() => {
+              setPendingImport(guestProgress);
+              setModal("import");
+            }}
+          >
+            迁移到当前账号
+          </Button>
+        </div>
       )}
     </div>
   );

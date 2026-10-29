@@ -35,7 +35,7 @@ function Test-ThisApp([int]$port, [string]$expectedRoot) {
         $response = $request.GetResponse()
         $reader = New-Object IO.StreamReader($response.GetResponseStream())
         try { $health = $reader.ReadToEnd() | ConvertFrom-Json } finally { $reader.Dispose() }
-        return ($health.app -eq 'h12-821-practice' -and $health.version -eq 1 -and $health.rootId -eq $expectedRoot)
+        return ($health.app -eq 'h12-821-practice' -and $health.version -eq 1 -and $health.backendVersion -eq 2 -and $health.rootId -eq $expectedRoot)
     } catch { return $false }
     finally { if ($response) { $response.Dispose() } }
 }

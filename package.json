@@ -1,13 +1,15 @@
 {
   "name": "h12-821-practice",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "private": true,
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1 --port 8211",
-    "build": "tsc -b && vite build",
+    "build": "tsc -b && vite build && node scripts/build-server.mjs",
     "typecheck": "tsc -b",
-    "test": "vitest run",
+    "test": "node scripts/build-server.mjs && vitest run --exclude tests/server.test.mjs",
+    "start": "node server.mjs",
+    "test:server": "node scripts/build-server.mjs && node --test tests/server.test.mjs",
     "format": "prettier --write src tests index.html package.json DESIGN.md UX-CONTRACT.md",
     "format:check": "prettier --check src tests index.html package.json DESIGN.md UX-CONTRACT.md"
   },

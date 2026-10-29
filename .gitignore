@@ -1,4 +1,7 @@
 node_modules/
+data/
+output/
+*.db
 design/
 h12-821-practice-server/
 premium-audit.json
